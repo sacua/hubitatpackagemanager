@@ -1,14 +1,16 @@
-/**
+ /**
  *
- *  Hubitat Package Manager v1.9.3
+ *  Hubitat Package Manager v1.10.0
  *
  *  Copyright 2020 Dominick Meglio
  *
- *    If you find this useful, donations are always appreciated 
+ *    If you find this useful, donations are always appreciated
  *    https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=7LBRPJRLJSDDN&source=url
  *
  *
  *
+ *    sacua   v1.10.0   Add librairy type of file for package manifest
+ *	
  *    csteele v1.9.3    improved displayHeader to include the Main Menu Option selected
  *                         refactored delete app to use new endpoint
  *    csteele v1.9.2    added 'Connection': 'keep-alive' to install/uninstall Apps, Drivers and Bundles
@@ -45,7 +47,7 @@
  *                         added feature to identify Azure search vs sql search
  */
 
-	public static String version()      {  return "v1.9.3"  }
+	public static String version()      {  return "v1.10.0"  }
 	def getThisCopyright(){"&copy; 2020 Dominick Meglio"}
 
 definition(
@@ -125,6 +127,8 @@ import java.util.regex.Matcher
 @Field static List appsToUninstallForModify = []
 @Field static List driversToInstallForModify = []
 @Field static List driversToUninstallForModify = []
+@Field static List librariesToInstallForModify = []
+@Field static List librariesToUninstallForModify = []
 @Field static List packagesMatchingInstalledEntries = []
 
 @Field static List iconTags = ["ZWave", "Zigbee", "Cloud", "LAN"]
@@ -528,11 +532,11 @@ def renderTags(pkgList) {
 		}
 		else
 			if (pkg.category?.trim()) { log.warn "Invalid category found: ${pkg.category} for ${pkg.location}" }
-			for (tag in pkg.tags) {
-				if (state.categoriesAndTags.tags.contains(tag)) {
-					if (!tags.contains(tag))
-						tags << tag
-				}
+		for (tag in pkg.tags) {
+			if (state.categoriesAndTags.tags.contains(tag)) {
+				if (!tags.contains(tag))
+					tags << tag
+			}
 			else
 				if (tag?.trim()) { log.warn "Invalid tag found: ${tag} for ${pkg.location}" }
 		}
@@ -780,6 +784,7 @@ def performInstallation() {
 	minimizeStoredManifests()
 
 	// Download all files first to reduce the chances of a network error
+	def libraryFiles = [:]
 	def appFiles = [:]
 	def driverFiles = [:]
 	def fileManagerFiles = [:]
@@ -790,9 +795,34 @@ def performInstallation() {
 	else
 		return triggerError("Failed download of file", "An error occurred downloading ${fileMgrResults.name}", false)
 
+	def requiredLibraries = getRequiredLibrariesFromManifest(manifest)
 	def requiredApps = getRequiredAppsFromManifest(manifest)
 	def requiredDrivers = getRequiredDriversFromManifest(manifest)
 	def requiredBundles = getRequiredBundlesFromManifest(manifest)
+
+	for (requiredLibrary in requiredLibraries) {					// required = true
+		def location = getItemDownloadLocation(requiredLibrary.value)
+		setBackgroundStatusMessage("Downloading ${requiredLibrary.value.name}")
+		def fileContents = downloadFile(location)
+		if (fileContents == null) {
+			state.manifests.remove(pkgInstall)
+			return triggerError("Failed download of required library file", "An error occurred downloading ${location}", false)
+		}
+		libraryFiles[location] = fileContents
+	}
+	for (libraryToInstall in librariesToInstall) {						// required = false (aka optional)
+		def matchedLibrary = manifest.libraries.find { it.id == libraryToInstall}
+		if (matchedLibrary != null) {
+			def location = getItemDownloadLocation(matchedLibrary)
+			setBackgroundStatusMessage("Downloading ${matchedLibrary.name}")
+			def fileContents = downloadFile(location)
+			if (fileContents == null) {
+				state.manifests.remove(pkgInstall)
+				return triggerError("Failed download of library file", "An error occurred downloading ${location}", false)
+			}
+			libraryFiles[location] = fileContents
+		}
+	}
 
 	for (requiredApp in requiredApps) {							// required = true
 		def location = getItemDownloadLocation(requiredApp.value)
@@ -863,6 +893,32 @@ def performInstallation() {
 				state.manifests.remove(pkgInstall)
 				return rollback("Failed to install bundle ${matchedBundle.name} using ${location}. Please notify the package developer.", false)
 			}
+		}
+	}
+
+	for (requiredLibrary in requiredLibraries) {					// required = true
+		def location = getItemDownloadLocation(requiredLibrary.value)
+		setBackgroundStatusMessage("Installing ${requiredLibrary.value.name}")
+		def id = installLibrary(libraryFiles[location])
+		if (id == null) {
+			state.manifests.remove(pkgInstall)
+			return triggerError("Failed to install the library ${location}. Please notify the package developer.", false)
+		}
+		requiredLibrary.value.heID = id
+		requiredLibrary.value.beta = shouldInstallBeta(requiredLibrary.value)
+	}
+	for (libraryToInstall in librariesToInstall) {						// required = false (aka optional)
+		def matchedLibrary = manifest.libraries.find { it.id == libraryToInstall}
+		if (matchedLibrary != null) {
+			def location = getItemDownloadLocation(matchedLibrary)
+			setBackgroundStatusMessage("Installing ${matchedLibrary.name}")
+			def id = installLibrary(libraryFiles[location])
+			if (id == null) {
+				state.manifests.remove(pkgInstall)
+				return rollback("Failed to install the library ${location}. Please notify the package developer.", false)
+			}
+			matchedLibrary.heID = id
+			matchedLibrary.beta = shouldInstallBeta(matchedLibrary)
 		}
 	}
 
@@ -965,13 +1021,22 @@ def prefPkgModifyChoices() {
 	logDebug "prefPkgModifyChoices"
 	def manifest = getInstalledManifest(pkgModify)
 
+	def optionalLibraries = getOptionalLibrariesFromManifest(manifest)
 	def optionalApps = getOptionalAppsFromManifest(manifest)
 	def optionalDrivers = getOptionalDriversFromManifest(manifest)
 	def optionalBundles = getOptionalBundlesFromManifest(manifest)
-	if (optionalApps?.size() > 0 || optionalDrivers?.size() > 0 || optionalBundles > 0) {
+	if (optionalLibraries?.size() > 0 || optionalApps?.size() > 0 || optionalDrivers?.size() > 0 || optionalBundles > 0) {
+		def installedOptionalLibraries = []
 		def installedOptionalApps = []
 		def installedOptionalDrivers = []
 		def installedOptionalBundles = []
+
+		for (optLibrary in optionalLibraries) {
+			if (isLibraryInstalled(manifest, optLibrary.key)) {
+				installedOptionalLibraries << optLibrary.key
+			}
+		}
+
 		for (optApp in optionalApps) {
 			if (isAppInstalled(manifest, optApp.key)) {
 				installedOptionalApps << optApp.key
@@ -995,6 +1060,8 @@ def prefPkgModifyChoices() {
 			section {
 				paragraph "<b>Modify a Package</b>"
 				paragraph "Items below that are checked are currently installed. Those that are not checked are currently <b>not</b> installed."
+				if (optionalLibraries.size() > 0)
+					input "librariesToModify", "enum", title: "Select the libraries to install/uninstall", options: optionalLibraries, hideWhenEmpty: true, multiple: true, defaultValue: installedOptionalLibraries
 				if (optionalApps.size() > 0)
 					input "appsToModify", "enum", title: "Select the apps to install/uninstall", options: optionalApps, hideWhenEmpty: true, multiple: true, defaultValue: installedOptionalApps
 				if (optionalDrivers.size() > 0)
@@ -1024,12 +1091,16 @@ def prefVerifyPackageChanges() {
 	if (state.mainMenu)
 		return prefOptions()
 	logDebug "prefVerifyPackageChanges"
+	def librariesToUninstallStr = "<ul>"
+	def librariesToInstallStr = "<ul>"
 	def appsToUninstallStr = "<ul>"
 	def appsToInstallStr = "<ul>"
 	def driversToUninstallStr = "<ul>"
 	def driversToInstallStr = "<ul>"
 	def bundlesToInstallStr = "<ul>"
 	def bundlesToUninstallStr = "<ul>"
+	librariesToUninstallForModify = []
+	librariesToInstallForModify = []
 	appsToUninstallForModify = []
 	appsToInstallForModify = []
 	bundlesToInstallForModify = []
@@ -1038,6 +1109,15 @@ def prefVerifyPackageChanges() {
 	def hasChanges = false
 
 	def manifest = getInstalledManifest(pkgModify)
+	for (optLibrary in librariesToModify) {
+		if (!isLibraryInstalled(manifest,optLibrary)) {
+			librariesToInstallStr += "<li>${getLibraryById(manifest,optLibrary).name}</li>"
+			librariesToInstallForModify << optLibrary
+			hasChanges = true
+		}
+	}
+	librariesToInstallStr += "</ul>"
+
 	for (optApp in appsToModify) {
 		if (!isAppInstalled(manifest,optApp)) {
 			appsToInstallStr += "<li>${getAppById(manifest,optApp).name}</li>"
@@ -1046,6 +1126,7 @@ def prefVerifyPackageChanges() {
 		}
 	}
 	appsToInstallStr += "</ul>"
+
 	for (optDriver in driversToModify) {
 		if (!isDriverInstalled(manifest,optDriver)) {
 			driversToInstallStr += "<li>${getDriverById(manifest,optDriver).name}</li>"
@@ -1055,8 +1136,18 @@ def prefVerifyPackageChanges() {
 	}
 	driversToInstallStr += "</ul>"
 
+	def installedLibraries = getInstalledOptionalLibraries(manifest) //New Line
 	def installedApps = getInstalledOptionalApps(manifest)
 	def installedDrivers = getInstalledOptionalDrivers(manifest)
+	for (installedLibrary in installedLibraries) { //New block of code
+		if (!driversToModify?.contains(installedLibrary)) {
+			librariesToUninstallStr += "<li>${getLibraryById(manifest,installedLibrary).name}</li>"
+			librariesToUninstallForModify << installedLibrary
+			hasChanges = true
+		}
+	}
+	librariesToUninstallStr += "</ul>"
+
 	for (installedApp in installedApps) {
 		if (!appsToModify?.contains(installedApp)) {
 			appsToUninstallStr += "<li>${getAppById(manifest,installedApp).name}</li>"
@@ -1074,6 +1165,7 @@ def prefVerifyPackageChanges() {
 		}
 	}
 	driversToUninstallStr += "</ul>"
+
 	for (optBundle in bundlesToModify) {
 		if (!isBundleInstalled(manifest,optBundle)) {
 			bundlesToInstallStr += "<li>${getBundleById(manifest,optBundle).name}</li>"
@@ -1089,6 +1181,10 @@ def prefVerifyPackageChanges() {
 			section {
 				paragraph "<b>Modify a Package</b>"
 				paragraph "The following changes will be made. Click next when you are ready. This may take some time."
+				if (librariesToUninstallStr != "<ul></ul>")
+					paragraph "The following libraries will be uninstalled: ${librariesToUninstallStr}"
+				if (librariesToInstallStr != "<ul></ul>")
+					paragraph "The following libraries will be installed: ${librariesToInstallStr}"
 				if (appsToUninstallStr != "<ul></ul>")
 					paragraph "The following apps will be uninstalled: ${appsToUninstallStr}"
 				if (appsToInstallStr != "<ul></ul>")
@@ -1101,7 +1197,7 @@ def prefVerifyPackageChanges() {
 					paragraph "The following bundles will be installed: ${bundlesToInstallStr}"
 
 				if (driversToUninstallStr != "<ul></ul>" || appsToUninstallStr != "<ul></ul>")
-					paragraph "Please be sure that the apps and drivers to be uninstalled are not in use before clicking Next."
+					paragraph "Please be sure that the apps, drivers and libraries to be uninstalled are not in use before clicking Next."
 			}
 			section {
 				paragraph "<hr>"
@@ -1156,11 +1252,22 @@ def performModify() {
 		return triggerError("Error logging in to hub", "An error occurred logging into the hub. Please verify your Hub Security username and password.", false)
 
 	// Download all files first to reduce the chances of a network error
+	def libraryFiles = [:]
 	def appFiles = [:]
 	def driverFiles = [:]
 	def bundleFiles = [:]
 	def manifest = getInstalledManifest(pkgModify)
 
+	for (libraryToInstall in librariesToInstallForModify) {
+		def library = getLibraryById(manifest, libraryToInstall)
+		def location = getItemDownloadLocation(library)
+		setBackgroundStatusMessage("Downloading ${library.name}")
+		def fileContents = downloadFile(location)
+		if (fileContents == null) {
+			return triggerError("Failed download of file", "An error occurred downloading ${location}", false)
+		}
+		libraryFiles[location] = fileContents
+	}
 	for (appToInstall in appsToInstallForModify) {
 		def app = getAppById(manifest, appToInstall)
 		def location = getItemDownloadLocation(app)
@@ -1192,6 +1299,19 @@ def performModify() {
 		}
 		else
 			completedActions["bundleInstalls"] << bundleToInstall
+	}
+
+	for (libraryToInstall in librariesToInstallForModify) {
+		def library = getLibraryById(manifest, libraryToInstall)
+		def location = getItemDownloadLocation(library)
+		setBackgroundStatusMessage("Installing ${library.name}")
+		def id = installLibrary(libraryFiles[location])
+		if (id != null) {
+			library.heID = id
+		}
+		else
+			return rollback("Failed to install library ${location}. Please notify the package developer.", false)
+
 	}
 
 	for (appToInstall in appsToInstallForModify) {
@@ -1243,6 +1363,18 @@ def performModify() {
 		}
 		else
 			return rollback("Failed to uninstall driver ${driver.name}. Please delete all instances of this device before uninstalling the package.", false)
+	}
+
+	for (libraryToUninstall in librariesToUninstallForModify) {
+		def library = getLibraryById(manifest, libraryToUninstall)
+		def sourceCode = getLibrarySource(library.heID)
+		setBackgroundStatusMessage("Uninstalling ${library.name}")
+		if (uninstallLibrary(library.heID)) {
+			completedActions["libraryUninstalls"] << [id:library.id,source:sourceCode]
+			library.heID = null
+		}
+		else
+			return rollback("Failed to uninstall library ${library.name}. Please delete all instances of this library before uninstalling the package.", false)
 	}
 
 	for (bundleToUninstall in bundlesToInstallForModify) {
@@ -1318,10 +1450,12 @@ def performRepair() {
 	if (!login())
 		return triggerError("Error logging in to hub", "An error occurred logging into the hub. Please verify your Hub Security username and password.", runInBackground)
 
+	def installedLibraries = getLibraryList()
 	def installedApps = getAppList()
 	def installedDrivers = getDriverList()
 
 	// Download all files first to reduce the chances of a network error
+	def libraryFiles = [:]
 	def appFiles = [:]
 	def driverFiles = [:]
 	def fileManagerFiles = [:]
@@ -1336,6 +1470,28 @@ def performRepair() {
 			fileManagerFiles = fileMgrResults.files
 		else
 			return triggerError("Failed download of file", "An error occurred downloading ${fileMgrResults.name}", false)
+		
+		for (library in manifest.libraries) {
+			def driverHeID = getLibraryById(installedManifest,library.id)?.heID
+			if (isLibraryInstalled(installedManifest,library.id) && installedDrivers.find { it -> it.id == libraryHeID }) {
+				def location = getItemDownloadLocation(library)
+				setBackgroundStatusMessage("Downloading ${library.name}")
+				def fileContents = downloadFile(location)
+				if (fileContents == null) {
+					return triggerError("Failed download of file", "An error occurred downloading ${location}", runInBackground)
+				}
+				libraryFiles[location] = fileContents
+			}
+			else if (library.required) {
+				setBackgroundStatusMessage("Downloading ${library.name} because it is required and not installed")
+				def location = getItemDownloadLocation(library)
+				def fileContents = downloadFile(location)
+				if (fileContents == null) {
+					return triggerError("Failed download of file", "An error occurred downloading ${location}", runInBackground)
+				}
+				libraryFiles[location] = fileContents
+			}
+		}
 		for (app in manifest.apps) {
 			def appHeID = getAppById(installedManifest,app.id)?.heID
 			if (isAppInstalled(installedManifest,app.id) && installedApps.find { it -> it.id == appHeID }) {
@@ -1396,6 +1552,33 @@ def performRepair() {
 			}
 			else
 				completedActions["bundleInstalls"] << bundleToInstall
+		}
+
+		for (library in manifest.libraries) {
+			def libraryHeID = getLibraryById(installedManifest,library.id)?.heID
+			if (isDriverInstalled(installedManifest,library.id) && installedLibraries.find { it -> it.id == libraryHeID }) {
+				def location = getItemDownloadLocation(library)
+				library.heID = getLibraryById(installedManifest, library.id).heID
+				library.beta = shouldInstallBeta(library)
+				def sourceCode = getLibrarySource(library.heID)
+				setBackgroundStatusMessage("Reinstalling ${library.name}")
+				if (upgradeLibrary(library.heID, libraryFiles[location])) {
+					completedActions["libraryUpgrades"] << [id:library.heID,source:sourceCode]
+				}
+				else
+					return rollback("Failed to upgrade library ${location}.  Please notify the package developer.", runInBackground)
+			}
+			else if (library.required) {
+				def location = getItemDownloadLocation(library)
+				setBackgroundStatusMessage("Installing ${library.name}")
+				def id = installLibrary(driverFiles[location])
+				if (id != null) {
+					library.heID = id
+					library.beta = shouldInstallBeta(library)
+				}
+				else
+					return rollback("Failed to install library ${location}.  Please notify the package developer.", runInBackground)
+			}
 		}
 
 		for (app in manifest.apps) {
@@ -1525,6 +1708,11 @@ def prefPkgUninstallConfirm() {
 						str += "<li>${driver.name} (Device Driver)</li>"
 				}
 
+				for (library in pkg.libraries) {
+					if (library.heID != null)
+						str += "<li>${library.name} (library)</li>"
+				}
+
 				for (bundle in pkg.bundles) {
 					if (bundle.name != null)
 						str += "<li>${bundle.name} (Bundle)</li>"
@@ -1576,6 +1764,19 @@ def performUninstall() {
 		def pkg = state.manifests[pkgToUninstall]
 
 		initializeRollbackState("uninstall")
+        
+        for (library in pkg.libraries) {
+		 	if (library.heID != null) {
+		 		def sourceCode = getLibrarySource(library.heID)
+		 		setBackgroundStatusMessage("Uninstalling ${library.name}")
+		 		if (uninstallLibrary(library.heID)) {
+		 			completedActions["libraryUninstalls"] << [id:library.id,source:sourceCode]
+		 		}
+		 		else
+		 			return rollback("Failed to uninstall library ${library.location}. Please delete all instances of this device before uninstalling the package.", false)
+		 	}
+
+		}
 
 		for (app in pkg.apps) {
 			if (app.heID != null) {
@@ -1680,7 +1881,41 @@ def performUpdateCheck() {
 				addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "package", null, newVersionResult.forceProduction)
 			}
 			else {
-				def appOrDriverNeedsUpdate = false
+				def appOrDriverOrLibraryNeedsUpdate = false
+				for (library in manifest.libraries) {
+					try {
+						if (library.id) { // skip if an app is not actually defined
+							def installedLibrary = getLibraryById(state.manifests[pkg.key], library.id)
+							if (library?.version != null && installedLibrary?.version != null) {
+								newVersionResult = newVersionAvailable(library, installedLibrary)
+								if (newVersionResult.newVersion) {
+									if (!appOrDriverOrLibraryNeedsUpdate) { // Only add a package to the list once
+										packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (driver or app or library has a new version)"]
+									}
+									appOrDriverOrLibraryNeedsUpdate = true
+									addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "specificlibrary", library, newVersionResult.forceProduction)
+								}
+							}
+							else if ((!installedLibrary || (!installedLibrary.required && installedLibrary.heID == null)) && library.required) {
+								if (!appOrDriverOrLibraryNeedsUpdate) { // Only add a package to the list once
+									packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (driver or app or library has a new requirement)"]
+								}
+								appOrDriverOrLibraryNeedsUpdate = true
+								addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "reqlibrary", library, false)
+							}
+							else if (!installedLibrary && !library.required) {
+								if (!appOrDriverOrLibraryNeedsUpdate) { // Only add a package to the list once
+									packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (new optional app or driver or library is available)"]
+								}
+								appOrDriverOrLibraryNeedsUpdate = true
+								addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "optlibrary", library, false)
+							}
+						}
+					}
+					catch (any) {
+						logInfo "Skipping a bad manifest ${state.manifests[pkg.key].packageName}. Please notify the package developer."
+					}
+				}
 				for (app in manifest.apps) {
 					try {
 						if (app.id) {  // skip if an app is not actually defined
@@ -1688,25 +1923,25 @@ def performUpdateCheck() {
 							if (app?.version != null && installedApp?.version != null) {
 								newVersionResult = newVersionAvailable(app, installedApp)
 								if (newVersionResult.newVersion) {
-									if (!appOrDriverNeedsUpdate) { // Only add a package to the list once
+									if (!appOrDriverOrLibraryNeedsUpdate) { // Only add a package to the list once
 										packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (driver or app has a new version)"]
 									}
-									appOrDriverNeedsUpdate = true
+									appOrDriverOrLibraryNeedsUpdate = true
 									addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "specificapp", app, newVersionResult.forceProduction)
 								}
 							}
 							else if ((!installedApp || (!installedApp.required && installedApp.heID == null)) && app.required) {
-								if (!appOrDriverNeedsUpdate) { // Only add a package to the list once
+								if (!appOrDriverOrLibraryNeedsUpdate) { // Only add a package to the list once
 									packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (driver or app has a new requirement)"]
 								}
-								appOrDriverNeedsUpdate = true
+								appOrDriverOrLibraryNeedsUpdate = true
 								addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "reqapp", app, false)
 							}
 							else if (!installedApp && !app.required) {
-								if (!appOrDriverNeedsUpdate) { // Only add a package to the list once
+								if (!appOrDriverOrLibraryNeedsUpdate) { // Only add a package to the list once
 									packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (new optional app or driver is available)"]
 								}
-								appOrDriverNeedsUpdate = true
+								appOrDriverOrLibraryNeedsUpdate = true
 								addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "optapp", app, false)
 							}
 						}
@@ -1722,26 +1957,26 @@ def performUpdateCheck() {
 							if (driver?.version != null && installedDriver?.version != null) {
 								newVersionResult = newVersionAvailable(driver, installedDriver)
 								if (newVersionResult.newVersion) {
-									if (!appOrDriverNeedsUpdate) {// Only add a package to the list once
+									if (!appOrDriverOrLibraryNeedsUpdate) {// Only add a package to the list once
 										packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (driver or app has a new version)"]
 									}
-									appOrDriverNeedsUpdate = true
+									appOrDriverOrLibraryNeedsUpdate = true
 									addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "specificdriver", driver, newVersionResult.forceProduction)
 								}
 							}
 							else if ((!installedDriver || (!installedDriver.required && installedDriver.heID == null)) && driver.required) {
-								if (!appOrDriverNeedsUpdate) { // Only add a package to the list once
+								if (!appOrDriverOrLibraryNeedsUpdate) { // Only add a package to the list once
 									packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (driver or app has a new requirement)"]
 								}
-								appOrDriverNeedsUpdate = true
+								appOrDriverOrLibraryNeedsUpdate = true
 								addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "reqdriver", driver, false)
 							}
 							else if (!installedDriver && !driver.required) {
 								addUpdateDetails(pkg.key, manifest.packageName, manifest.releaseNotes, "optdriver", driver, false)
-								if (!appOrDriverNeedsUpdate) { // Only add a package to the list once
+								if (!appOrDriverOrLibraryNeedsUpdate) { // Only add a package to the list once
 									packagesWithUpdates << ["${pkg.key}": "${state.manifests[pkg.key].packageName} (new optional app or driver is available)"]
 								}
-								appOrDriverNeedsUpdate = true
+								appOrDriverOrLibraryNeedsUpdate = true
 							}
 						}
 					}
@@ -1801,7 +2036,7 @@ def prefPkgUpdate() {
 					for (pkgToUpdate in pkgsToUpdate) {
 						def updateDetailsForPkg = updateDetails[pkgToUpdate]
 						for (details in updateDetailsForPkg.items) {
-							if (details.type == "optapp" || details.type == "optdriver") {
+							if (details.type == "optapp" || details.type == "optdriver" || details.type == "optlibrary") {
 								optionalItemsToShow["${pkgToUpdate}~${details.id}"] = "${details.name} (${updateDetailsForPkg.name})"
 							}
 						}
@@ -1930,7 +2165,7 @@ def shouldUpgrade(pkg, id) {
 	for (updateItem in pkgUpdateDetails.items) {
 		if (updateItem.type == "package")
 			return true
-		else if ((updateItem.type == "specificapp" || updateItem.type == "specificdriver") && updateItem.id == id)
+		else if ((updateItem.type == "specificapp" || updateItem.type == "specificdriver" || updateItem.type == "specificlibrary") && updateItem.id == id)
 			return true
 	}
 	return false
@@ -1939,7 +2174,7 @@ def shouldUpgrade(pkg, id) {
 def optionalItemsOnly(pkg) {
 	def pkgUpdateDetails = updateDetails[pkg]
 	for (updateItem in pkgUpdateDetails.items) {
-		if (updateItem.type == "package" || updateItem.type == "specificapp" || updateItem.type == "specificdriver" || updateItem.type == "reqapp" || updateItem.type == "reqdriver")
+		if (updateItem.type == "package" || updateItem.type == "specificapp" || updateItem.type == "specificdriver" || updateItem.type == "specificlibrary" || updateItem.type == "reqapp" || updateItem.type == "reqdriver" || updateItem.type == "reqlibrary")
 			return false
 	}
 	return true
@@ -1951,7 +2186,7 @@ def forceProduction(pkg, id) {
 	for (updateItem in pkgUpdateDetails.items) {
 		if (updateItem.type == "package")
 			return updateItem.forceProduction
-		else if ((updateItem.type == "specificapp" || updateItem.type == "specificdriver") && updateItem.id == id)
+		else if ((updateItem.type == "specificapp" || updateItem.type == "specificdriver" || updateItem.type == "specificlibrary") && updateItem.id == id)
 			return updateItem.forceProduction
 	}
 	return false
@@ -1967,6 +2202,7 @@ def performUpdates(runInBackground) {
 
 	// Download all files first to reduce the chances of a network error
 	def downloadedManifests = [:]
+	def libraryFiles = [:]
 	def appFiles = [:]
 	def driverFiles = [:]
 	def fileManagerFiles = [:]
@@ -1992,6 +2228,65 @@ def performUpdates(runInBackground) {
 				fileManagerFiles = fileManagerFiles + fileMgrResults.files
 			else
 				return triggerError("Failed download of file", "An error occurred downloading ${fileMgrResults.name}", false)
+			
+			for (library in manifest.libraries) {
+				if (isLibraryInstalled(installedManifest,library.id)) {
+					if (shouldUpgrade(pkg, library.id)) {
+						def location
+						if (!forceProduction(pkg, library.id))
+							location = getItemDownloadLocation(library)
+						else
+							location = library.location
+						setBackgroundStatusMessage("Downloading ${library.name}")
+						def fileContents = downloadFile(location)
+						if (fileContents == null) {
+							resultData.success = false
+							resultData.failed << pkg
+							resultData.message = triggerError("Failed download of file", "An error occurred downloading ${location}", runInBackground)
+							return resultData
+						}
+						libraryFiles[location] = fileContents
+					}
+				}
+				else if (library.required && !optionalItemsOnly(pkg)) {
+					def location
+					if (!forceProduction(pkg, library.id))
+						location = getItemDownloadLocation(library)
+					else
+						location = library.location
+					setBackgroundStatusMessage("Downloading ${library.name} because it is required and not installed")
+					def fileContents = downloadFile(location)
+					if (fileContents == null) {
+						resultData.success = false
+						resultData.failed << pkg
+						resultData.message = triggerError("Failed download of file", "An error occurred downloading ${location}", runInBackground)
+						return resultData
+					}
+					libraryFiles[location] = fileContents
+				}
+				else {
+					def location
+					if (!forceProduction(pkg, library.id))
+						location = getItemDownloadLocation(library)
+					else
+						location = library.location
+					for (optItem in pkgsToAddOpt) {
+						def splitParts = optItem.split('~')
+						if (splitParts[0] == pkg && splitParts[1] == library.id) {
+							setBackgroundStatusMessage("Downloading optional component ${library.name}")
+							def fileContents = downloadFile(location)
+							if (fileContents == null) {
+								resultData.success = false
+								resultData.failed << pkg
+								resultData.message = triggerError("Failed download of file", "An error occurred downloading ${location}", runInBackground)
+								return resultData
+							}
+							driverFiles[location] = fileContents
+						}
+					}
+				}
+			}
+
 			for (app in manifest.apps) {
 				if (isAppInstalled(installedManifest,app.id)) {
 					if (shouldUpgrade(pkg, app.id)) {
@@ -2138,6 +2433,76 @@ def performUpdates(runInBackground) {
 				}
 				else
 					completedActions["bundleInstalls"] << bundleToInstall
+			}
+
+			for (library in manifest.libraries) {
+				if (isLibraryInstalled(installedManifest,library.id)) {
+					if (shouldUpgrade(pkg, library.id)) {
+						def location
+						if (!forceProduction(pkg, library.id))
+							location = getItemDownloadLocation(library)
+						else
+							location = library.location
+						library.heID = getLibraryById(installedManifest, library.id).heID
+						library.beta = shouldInstallBeta(library) && !forceProduction(pkg, library.id)
+						def sourceCode = getLibrarySource(library.heID)
+						setBackgroundStatusMessage("Upgrading ${library.name}")
+						if (upgradeLibrary(library.heID, libraryFiles[location])) {
+							completedActions["libraryUpgrades"] << [id:library.heID,source:sourceCode]
+						}
+						else {
+							resultData.success = false
+							resultData.failed << pkg
+							resultData.message = rollback("Failed to upgrade library ${location}", runInBackground)
+							return resultData
+						}
+					}
+				}
+				else if (library.required && !optionalItemsOnly(pkg)) {
+					def location
+					if (!forceProduction(pkg, library.id))
+						location = getItemDownloadLocation(library)
+					else
+						location = library.location
+					setBackgroundStatusMessage("Installing ${library.name}")
+					def id = installLibrary(libraryFiles[location])
+					if (id != null) {
+						library.heID = id
+						library.beta = shouldInstallBeta(library) && !forceProduction(pkg, library.id)
+					}
+					else {
+						resultData.success = false
+						resultData.failed << pkg
+						resultData.message = rollback("Failed to install library ${location}", runInBackground)
+						return resultData
+					}
+				}
+				else {
+					def location
+					if (!forceProduction(pkg, library.id))
+						location = getItemDownloadLocation(library)
+					else
+						location = library.location
+					for (optItem in pkgsToAddOpt) {
+						def splitParts = optItem.split('~')
+						if (splitParts[0] == pkg) {
+							if (splitParts[1] == library.id) {
+								setBackgroundStatusMessage("Installing ${library.name}")
+								def id = installLibrary(libraryFiles[location])
+								if (id != null) {
+									library.heID = id
+									library.beta = shouldInstallBeta(library) && !forceProduction(pkg, library.id)
+								}
+								else {
+									resultData.success = false
+									resultData.failed << pkg
+									resultData.message = rollback("Failed to install library ${location}", runInBackground)
+									return resultData
+								}
+							}
+						}
+					}
+				}
 			}
 
 			for (app in manifest.apps) {
@@ -2316,7 +2681,7 @@ def performUpdates(runInBackground) {
 	}
 }
 
-def prefPkgMatchUp() {
+def prefPkgMatchUp() { //All method related to matchup does not include library
 	if (state.mainMenu)
 		return prefOptions()
 	logDebug "prefPkgMatchUp"
@@ -2809,10 +3174,12 @@ def clearStateSettings(clearProgress) {
 	app.removeSetting("pkgInstall")
 	app.removeSetting("appsToInstall")
 	app.removeSetting("driversToInstall")
+	app.removeSetting("librariesToInstall")
 	app.removeSetting("pkgModify")
 	app.removeSetting("pkgRepair")
 	app.removeSetting("appsToModify")
 	app.removeSetting("driversToModify")
+	app.removeSetting("librarieToModify")
 	app.removeSetting("pkgUninstall")
 	app.removeSetting("pkgsToUpdate")
 	app.removeSetting("pkgsToAddOpt")
@@ -2853,6 +3220,8 @@ def clearStateSettings(clearProgress) {
 	state.remove("appsToUninstall")
 	state.remove("driversToInstall")
 	state.remove("driversToUninstall")
+	state.remove("librariesToInstall") 
+	state.remove("librariesToUninstall")
 	state.remove("packagesWithMatches")
 	state.remove("updateManifest")
 }
@@ -2860,10 +3229,13 @@ def clearStateSettings(clearProgress) {
 def initializeRollbackState(action) {
 	installAction = action
 	completedActions = [:]
+	completedActions["libraryInstalls"] = []
 	completedActions["appInstalls"] = []
 	completedActions["driverInstalls"] = []
+	completedActions["libraryUninstalls"] = []
 	completedActions["appUninstalls"] = []
 	completedActions["driverUninstalls"] = []
+	completedActions["libraryUpgrades"] = []
 	completedActions["appUpgrades"] = []
 	completedActions["driverUpgrades"] = []
 	completedActions["fileUninstalls"] = []
@@ -2908,6 +3280,18 @@ def isDriverInstalled(manifest, id) {
 	return false
 }
 
+def isLibraryInstalled(manifest, id) {
+	for (library in manifest.libraries) {
+		if (library.id == id) {
+			if (library.heID != null)
+				return true
+			else
+				return false
+		}
+	}
+	return false
+}
+
 def isBundleInstalled(manifest, id) {
 	for (bundle in manifest.bundles) {
 		if (bundle.id == id) {
@@ -2938,6 +3322,15 @@ def getDriverById(manifest, id) {
 	return null
 }
 
+def getLibraryById(manifest, id) {
+	for (library in manifest.libraries) {
+		if (library.id == id) {
+			return library
+		}
+	}
+	return null
+}
+
 def getAppByHEId(manifest, id) {
 	for (app in manifest.apps) {
 		if (app.heID == id) {
@@ -2951,6 +3344,15 @@ def getDriverByHEId(manifest, id) {
 	for (driver in manifest.drivers) {
 		if (driver.heID == id) {
 			return driver
+		}
+	}
+	return null
+}
+
+def getLibraryByHEId(manifest, id) {
+	for (library in manifest.libraries) {
+		if (library.heID == id) {
+			return library
 		}
 	}
 	return null
@@ -2971,6 +3373,16 @@ def getInstalledOptionalDrivers(manifest) {
 	for (driver in manifest.drivers) {
 		if (driver.heID != null && driver.required == false) {
 			result << driver.id
+		}
+	}
+	return result
+}
+
+def getInstalledOptionalLibraries(manifest) {
+	def result = []
+	for (library in manifest.libraries) {
+		if (library.heID != null && library.required == false) {
+			result << library.id
 		}
 	}
 	return result
@@ -3129,6 +3541,15 @@ def getOptionalDriversFromManifest(manifest) {
 	return driversList
 }
 
+def getOptionalLibrariesFromManifest(manifest) {
+	def librariesList = [:]
+	for (library in manifest?.libraries) {
+		if (library.required == false)
+			librariesList << ["${library.id}":library.name]
+	}
+	return librariesList
+}
+
 def getOptionalBundlesFromManifest(manifest) {
 	def bundlesList = [:]
 	for (bundle in manifest?.bundles) {
@@ -3154,6 +3575,15 @@ def getRequiredDriversFromManifest(manifest) {
 			driversList << ["${driver.id}":driver]
 	}
 	return driversList
+}
+
+def getRequiredLibrariesFromManifest(manifest) {
+	def librariesList = [:]
+	for (library in manifest.libraries) {
+		if (library.required == true || library.required == "true")
+			librariesList << ["${library.id}":library]
+	}
+	return librariesList
 }
 
 def getRequiredBundlesFromManifest(manifest) {
@@ -3520,7 +3950,7 @@ def installDriver(driverCode) {
 			path: "/driver/save",
 			requestContentType: "application/x-www-form-urlencoded",
 			headers: [
-	        		"Connection": 'keep-alive',
+	        	"Connection": 'keep-alive',
 				"Cookie": state.cookie
 			],
 			body: [
@@ -3557,7 +3987,7 @@ def upgradeDriver(id,appCode) {
 			path: "/driver/ajax/update",
 			requestContentType: "application/x-www-form-urlencoded",
 			headers: [
-	    			"Connection": 'keep-alive',
+	    		"Connection": 'keep-alive',
 				"Cookie": state.cookie
 			],
 			body: [
@@ -3673,6 +4103,159 @@ def getDriverVersion(id) {
 	def params = [
 		uri: getBaseUrl(),
 		path: "/driver/ajax/code",
+		requestContentType: "application/x-www-form-urlencoded",
+		headers: [
+			"Cookie": state.cookie
+		],
+		query: [
+			id: id
+		],
+		ignoreSSLIssues: true
+	]
+	def result
+	httpGet(params) { resp ->
+		result = resp.data.version
+	}
+	return result
+}
+
+// Library installation methods
+def installLibrary(libraryCode) {
+	try
+	{
+		def params = [
+			uri: "http://127.0.0.1:8080",
+			path: "/library/save",
+			requestContentType: "application/x-www-form-urlencoded",
+			headers: [
+				"Cookie": state.cookie
+			],
+			body: [
+				id: "",
+				version: "",
+				create: "",
+				source: libraryCode
+			],
+			timeout: 300,
+			ignoreSSLIssues: true
+		]
+		def result
+		httpPost(params) { resp ->
+			if (resp.headers."Location" != null) {
+				result = resp.headers."Location".replaceAll("https?://127.0.0.1:(?:8080|8443)/library/editor/","")
+				completedActions["libraryInstalls"] << result
+			}
+			else
+				result = null
+		}
+		return result
+	}
+	catch (e) {
+		log.error "Error installing library: ${e}"
+	}
+	return null
+}
+
+def upgradelibrary(id,libraryCode) {
+	try
+	{
+		def params = [
+			uri: "http://127.0.0.1:8080",
+			path: "/library/ajax/update",
+			requestContentType: "application/x-www-form-urlencoded",
+			headers: [
+				"Cookie": state.cookie
+			],
+			body: [
+				id: id,
+				version: getLibraryVersion(id),
+				source: libraryCode
+			],
+			timeout: 300,
+			ignoreSSLIssues: true
+		]
+		def result = false
+		httpPost(params) { resp ->
+			result = resp.data.status == "success"
+		}
+		return result
+	}
+	catch (e) {
+		log.error "Error upgrading library ${e}"
+	}
+	return null
+}
+
+def uninstallLibrary(id) {
+	try
+	{
+		def params = [
+			uri: "http://127.0.0.1:8080",
+			path: "/library/edit/update",
+			requestContentType: "application/x-www-form-urlencoded",
+			headers: [
+				"Cookie": state.cookie
+			],
+			body: [
+				id: id,
+				"_action_delete": "Delete"
+			],
+			timeout: 300,
+			textParser: true,
+			ignoreSSLIssues: true
+		]
+		def result = true
+		httpPost(params) { resp ->
+			if (resp.data == null)
+				result = true
+			else {
+				def matcherText = resp.data.text.replace("\n","").replace("\r","")
+				def matcher = matcherText.find(/<div class="close alert-close" data-dismiss="alert" aria-label="Close"><span aria-hidden="true">&times;<\/span><\/div>(.+?)<\/div>/)
+				if (matcher)
+					result = false
+			}
+		}
+		return result
+	}
+	catch (e)
+	{
+		log.error "Error uninstalling library: ${e}"
+		return false
+	}
+}
+
+def getLibrarySource(id) {
+	try
+	{
+		def params = [
+			uri: "http://127.0.0.1:8080",
+			path: "/library/ajax/code",
+			requestContentType: "application/x-www-form-urlencoded",
+			headers: [
+				"Cookie": state.cookie
+			],
+			query: [
+				id: id
+			],
+			timeout: 300,
+			ignoreSSLIssues: true
+		]
+		def result
+		httpGet(params) { resp ->
+			result = resp.data.source
+		}
+		return result
+	}
+	catch (e) {
+		log.error "Error retrieving library source: ${e}"
+	}
+	return null
+}
+
+def getLibraryVersion(id) {
+	def params = [
+		uri: "http://127.0.0.1:8080",
+		path: "/library/ajax/code",
 		requestContentType: "application/x-www-form-urlencoded",
 		headers: [
 			"Cookie": state.cookie
@@ -3969,6 +4552,8 @@ def rollback(error, runInBackground) {
 			uninstallApp(installedApp)
 		for (installedDriver in completedActions["driverInstalls"])
 			uninstallDriver(installedDriver)
+		for (installedLibrary in completedActions["libraryInstalls"]) //New Line
+			uninstallLibrary(installedLibrary) //New Line
 		for (installedFile in completedActions["fileInstalls"])
 			uninstallFile(installedFile.id, installedFile.name)
 		for (installedBundle in completedActions["bundleInstalls"])
@@ -3979,6 +4564,8 @@ def rollback(error, runInBackground) {
 			getAppByHEId(manifest, installedApp).heID = null
 		for (installedDriver in completedActions["driverInstalls"])
 			getDriverByHEId(manifest, installedDriver).heID = null
+		for (installedLibrary in completedActions["libraryInstalls"]) //New Line
+			getLibraryByHEId(manifest, installedLibrary).heID = null //New Line
 	}
 	if (installAction == "modify" || installAction == "uninstall") {
 		for (uninstalledApp in completedActions["appUninstalls"]) {
@@ -3992,16 +4579,21 @@ def rollback(error, runInBackground) {
 			def newHeID = installDriver(uninstalledDriver.source)
 			getDriverById(manifest, uninstalledDriver.id).heID = newHeID
 		}
-
+		for (uninstalledLibrary in completedActions["libraryUninstalls"]) { //New block of code
+			def newHeID = installLibrary(uninstalledLibrary.source)
+			getLibraryById(manifest, uninstalledLibrary.id).heID = newHeID
+		}
 		for (uninstalledFile in completedActions["fileUninstalls"]) {
 			installFile(uninstalledFile.name, downloadFile(uninstalledFile.location))
 		}
-
 		for (uninstalledBundle in completedActions["bundleUninstalls"]) {
 			installBundle(uninstalledBundle.location)
 		}
 	}
 	if (installAction == "update") {
+		for (upgradedLibrary in completedActions["libraryUpgrades"]) { //New block of code
+			upgradeLibrary(upgradedLibrary.heID,upgradedLibrary.source)
+		}
 		for (upgradedApp in completedActions["appUpgrades"]) {
 			upgradeApp(upgradedApp.heID,upgradedApp.source)
 		}
@@ -4096,6 +4688,7 @@ def updateRepositoryListing() {
 def copyInstalledItemsToNewManifest(srcManifest, destManifest) {
 	def srcInstalledApps = srcManifest.apps?.findAll { it -> it.heID != null }
 	def srcInstalledDrivers = srcManifest.drivers?.findAll { it -> it.heID != null }
+	def srcInstalledLibraries = srcManifest.libraries?.findAll { it -> it.heID != null } //New line
 	def switchedToPackageVersion = false
 	if (srcManifest.version == null && destManifest.version != null)
 		switchedToPackageVersion = true
@@ -4117,6 +4710,16 @@ def copyInstalledItemsToNewManifest(srcManifest, destManifest) {
 		if (switchedToPackageVersion) {
 			destDriver.remove("version")
 			destDriver.remove("betaVersion")
+		}
+	}
+
+	for (library in srcInstalledLibraries) { //New block
+		def destLibrary = destManifest.library?.find { it -> it.id == driver.id }
+		if (destLibrary && destLibrary.heID == null)
+			destLibrary.heID = library.heID
+		if (switchedToPackageVersion) {
+			destLibrary.remove("version")
+			destLibrary.remove("betaVersion")
 		}
 	}
 
@@ -4445,6 +5048,34 @@ def getAppList() {
 			log.error "Error retrieving installed apps: ${e}"
 		} 
 
+	}
+	return result
+}
+
+
+def getLibraryList() {//New block of code
+	def params = [
+		uri: "http://127.0.0.1:8080/library/list",
+		textParser: true,
+		headers: [
+			Cookie: state.cookie
+		]
+	  ]
+
+	def result = []
+	try {
+		httpGet(params) { resp ->
+			def matcherText = resp.data.text.replace("\n","").replace("\r","")
+			def matcher = matcherText.findAll(/(<tr class="lib-row" data-lib-id="[^<>]+">.*?<\/tr>)/).each {
+				def allFields = it.findAll(/(<td .*?<\/td>)/) // { match,f -> return f }
+				def id = it.find(/data-lib-id="([^"]+)"/) { match,i -> return i.trim() }
+				def title = allFields[0].find(/title="([^"]+)/) { match,t -> return t.trim() }
+				def namespace = allFields[1].find(/>([^"]+)</) { match,ns -> return ns.trim() }
+				result += [id:id,title:title,namespace:namespace]
+			}
+		}
+	} catch (e) {
+		log.error "Error retrieving installed apps: ${e}"
 	}
 	return result
 }
