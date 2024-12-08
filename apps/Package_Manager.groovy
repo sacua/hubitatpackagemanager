@@ -1314,6 +1314,18 @@ def performModify() {
 
 	}
 
+	for (libraryToUninstall in librariesToUninstallForModify) {
+		def library = getLibraryById(manifest, libraryToUninstall)
+		def sourceCode = getLibrarySource(library.heID)
+		setBackgroundStatusMessage("Uninstalling ${library.name}")
+		if (uninstallLibrary(library.heID)) {
+			completedActions["libraryUninstalls"] << [id:library.id,source:sourceCode]
+			library.heID = null
+		}
+		else
+			return rollback("Failed to uninstall library ${library.name}. Please delete all instances of this library before uninstalling the package.", false)
+	}
+
 	for (appToInstall in appsToInstallForModify) {
 		def app = getAppById(manifest, appToInstall)
 		def location = getItemDownloadLocation(app)
@@ -1363,18 +1375,6 @@ def performModify() {
 		}
 		else
 			return rollback("Failed to uninstall driver ${driver.name}. Please delete all instances of this device before uninstalling the package.", false)
-	}
-
-	for (libraryToUninstall in librariesToUninstallForModify) {
-		def library = getLibraryById(manifest, libraryToUninstall)
-		def sourceCode = getLibrarySource(library.heID)
-		setBackgroundStatusMessage("Uninstalling ${library.name}")
-		if (uninstallLibrary(library.heID)) {
-			completedActions["libraryUninstalls"] << [id:library.id,source:sourceCode]
-			library.heID = null
-		}
-		else
-			return rollback("Failed to uninstall library ${library.name}. Please delete all instances of this library before uninstalling the package.", false)
 	}
 
 	for (bundleToUninstall in bundlesToInstallForModify) {
@@ -1698,6 +1698,11 @@ def prefPkgUninstallConfirm() {
 			def str = "<ul>"
 			for (pkgToUninstall in pkgUninstall) {
 				def pkg = state.manifests[pkgToUninstall]
+				for (library in pkg.libraries) {
+					if (library.heID != null)
+						str += "<li>${library.name} (library)</li>"
+				}
+
 				for (app in pkg.apps) {
 					if (app.heID != null)
 						str += "<li>${app.name} (App)</li>"
@@ -1706,11 +1711,6 @@ def prefPkgUninstallConfirm() {
 				for (driver in pkg.drivers) {
 					if (driver.heID != null)
 						str += "<li>${driver.name} (Device Driver)</li>"
-				}
-
-				for (library in pkg.libraries) {
-					if (library.heID != null)
-						str += "<li>${library.name} (library)</li>"
 				}
 
 				for (bundle in pkg.bundles) {
@@ -1764,8 +1764,8 @@ def performUninstall() {
 		def pkg = state.manifests[pkgToUninstall]
 
 		initializeRollbackState("uninstall")
-        
-        for (library in pkg.libraries) {
+		
+		for (library in pkg.libraries) {
 		 	if (library.heID != null) {
 		 		def sourceCode = getLibrarySource(library.heID)
 		 		setBackgroundStatusMessage("Uninstalling ${library.name}")
@@ -2681,7 +2681,7 @@ def performUpdates(runInBackground) {
 	}
 }
 
-def prefPkgMatchUp() { //All method related to matchup does not include library
+def prefPkgMatchUp() { //All method related to matchup does not include library (most likely not necessary since library are not published alone)
 	if (state.mainMenu)
 		return prefOptions()
 	logDebug "prefPkgMatchUp"
@@ -3819,7 +3819,7 @@ def uninstallApp(id) {
 				timeout: 300,
 				ignoreSSLIssues: true
 			]
-            result = false
+			result = false
  			httpGet(params) { resp ->
 				if (resp.data.status == true) result = true
 			}
@@ -3950,7 +3950,7 @@ def installDriver(driverCode) {
 			path: "/driver/save",
 			requestContentType: "application/x-www-form-urlencoded",
 			headers: [
-	        	"Connection": 'keep-alive',
+				"Connection": 'keep-alive',
 				"Cookie": state.cookie
 			],
 			body: [
@@ -3987,7 +3987,7 @@ def upgradeDriver(id,appCode) {
 			path: "/driver/ajax/update",
 			requestContentType: "application/x-www-form-urlencoded",
 			headers: [
-	    		"Connection": 'keep-alive',
+				"Connection": 'keep-alive',
 				"Cookie": state.cookie
 			],
 			body: [
@@ -4124,10 +4124,11 @@ def installLibrary(libraryCode) {
 	try
 	{
 		def params = [
-			uri: "http://127.0.0.1:8080",
+			uri: getBaseUrl(),
 			path: "/library/save",
 			requestContentType: "application/x-www-form-urlencoded",
 			headers: [
+				"Connection": 'keep-alive',
 				"Cookie": state.cookie
 			],
 			body: [
@@ -4136,7 +4137,7 @@ def installLibrary(libraryCode) {
 				create: "",
 				source: libraryCode
 			],
-			timeout: 300,
+			timeout: 420,
 			ignoreSSLIssues: true
 		]
 		def result
@@ -4160,10 +4161,11 @@ def upgradelibrary(id,libraryCode) {
 	try
 	{
 		def params = [
-			uri: "http://127.0.0.1:8080",
+			uri: getBaseUrl(),
 			path: "/library/ajax/update",
 			requestContentType: "application/x-www-form-urlencoded",
 			headers: [
+				"Connection": 'keep-alive',
 				"Cookie": state.cookie
 			],
 			body: [
@@ -4171,7 +4173,7 @@ def upgradelibrary(id,libraryCode) {
 				version: getLibraryVersion(id),
 				source: libraryCode
 			],
-			timeout: 300,
+			timeout: 420,
 			ignoreSSLIssues: true
 		]
 		def result = false
@@ -4187,40 +4189,63 @@ def upgradelibrary(id,libraryCode) {
 }
 
 def uninstallLibrary(id) {
-	try
-	{
-		def params = [
-			uri: "http://127.0.0.1:8080",
-			path: "/library/edit/update",
-			requestContentType: "application/x-www-form-urlencoded",
-			headers: [
-				"Cookie": state.cookie
-			],
-			body: [
-				id: id,
-				"_action_delete": "Delete"
-			],
-			timeout: 300,
-			textParser: true,
-			ignoreSSLIssues: true
-		]
-		def result = true
-		httpPost(params) { resp ->
-			if (resp.data == null)
-				result = true
-			else {
-				def matcherText = resp.data.text.replace("\n","").replace("\r","")
-				def matcher = matcherText.find(/<div class="close alert-close" data-dismiss="alert" aria-label="Close"><span aria-hidden="true">&times;<\/span><\/div>(.+?)<\/div>/)
-				if (matcher)
-					result = false
+	if (location.hub.firmwareVersionString >= "2.3.8.128") {
+		try {
+			def params = [
+				uri: getBaseUrl(),
+				path: "/library/edit/deleteJsonSafe/$id", 
+				headers: [
+					"Cookie": state.cookie
+				],
+				timeout: 300,
+				ignoreSSLIssues: true
+			]
+			result = false
+ 			httpGet(params) { resp ->
+				if (resp.data.status == true) result = true
 			}
+			return result
 		}
-		return result
-	}
-	catch (e)
-	{
-		log.error "Error uninstalling library: ${e}"
-		return false
+		catch (e) {
+			log.error "Error uninstalling library ${e}"
+			return false
+		}
+	} else {
+		try
+		{
+			def params = [
+				uri: getBaseUrl(),
+				path: "/library/edit/update",
+				requestContentType: "application/x-www-form-urlencoded",
+				headers: [
+					"Cookie": state.cookie
+				],
+				body: [
+					id: id,
+					"_action_delete": "Delete"
+				],
+				timeout: 300,
+				textParser: true,
+				ignoreSSLIssues: true
+			]
+			def result = true
+			httpPost(params) { resp ->
+				if (resp.data == null)
+					result = true
+				else {
+					def matcherText = resp.data.text.replace("\n","").replace("\r","")
+					def matcher = matcherText.find(/<div class="close alert-close" data-dismiss="alert" aria-label="Close"><span aria-hidden="true">&times;<\/span><\/div>(.+?)<\/div>/)
+					if (matcher)
+						result = false
+				}
+			}
+			return result
+		}
+		catch (e)
+		{
+			log.error "Error uninstalling library: ${e}"
+			return false
+		}
 	}
 }
 
@@ -4228,7 +4253,7 @@ def getLibrarySource(id) {
 	try
 	{
 		def params = [
-			uri: "http://127.0.0.1:8080",
+			uri: getBaseUrl(),
 			path: "/library/ajax/code",
 			requestContentType: "application/x-www-form-urlencoded",
 			headers: [
@@ -4254,7 +4279,7 @@ def getLibrarySource(id) {
 
 def getLibraryVersion(id) {
 	def params = [
-		uri: "http://127.0.0.1:8080",
+		uri: getBaseUrl(),
 		path: "/library/ajax/code",
 		requestContentType: "application/x-www-form-urlencoded",
 		headers: [
@@ -4347,11 +4372,11 @@ def installBundle(bundleLocation, bundlePrimary=false) {
 		{
 			def params = [
 				uri: "${getBaseUrl()}/bundle2/uploadZipFromUrl?url=${URLEncoder.encode(bundleLocation, "UTF-8")}&pwd=&private=$bundlePrimary",
-	 			headers: [
+				headers: [
 					"Connection": 'keep-alive',
 					"Cookie": state.cookie
 				],
-	 			timeout: 300,
+				timeout: 300,
 				ignoreSSLIssues: true
 			]
 			httpGet(params) { resp ->
@@ -4367,26 +4392,25 @@ def installBundle(bundleLocation, bundlePrimary=false) {
 	} else {
 		try
 		{
-      	  def params = [
-      	      uri: getBaseUrl(),
-      	      path: "/bundle/uploadZipFromUrl",
-      	      headers: [
-      	          "Accept": '*/*', // */
-      	          "ContentType": 'text/plain; charset=utf-8',
-			    "Connection": 'keep-alive',
-      	          "Cookie": state.cookie
-      	      ],
- 			body: groovy.json.JsonOutput.toJson(
-				url: bundleLocation,
-				installer: bundlePrimary,
-				pwd: ""
-			),
-      	      timeout: 420,
-      	      ignoreSSLIssues: true
-      	  ]
+			def params = [
+				uri: getBaseUrl(),
+				path: "/bundle/uploadZipFromUrl",
+				headers: [
+					"Accept": '*/*', // */
+					"ContentType": 'text/plain; charset=utf-8',
+					"Connection": 'keep-alive',
+					"Cookie": state.cookie
+				],
+ 				body: groovy.json.JsonOutput.toJson(
+					url: bundleLocation,
+					installer: bundlePrimary,
+					pwd: ""
+				),
+				timeout: 420,
+				ignoreSSLIssues: true
+			]
 			httpPost(params) { resp ->
-	
-      	  }
+			}
 			return true
 		}
 		catch (e) {
@@ -4403,53 +4427,53 @@ def uninstallBundle(bundleName) {
 // in platform v2.3.2 getInstalledBundlesList() was added,
 //     A function returning a list of Maps with attributes id, name, and namespace, one Map per bundle
 
-    if (location.hub.firmwareVersionString >= "2.3.2.120") {
-    	  HEid = getInstalledBundlesList().findAll{it.name == bundleName}.id[0]
-    }
-    else
-    {
-	  def gIB = []
-        def params = [
-    	      uri: getBaseUrl(),
-    	      path: "/bundle/list",
-    	      contentType: "text/html",
-    	      textParser: true,
-    	      headers: [
-	        "Connection": 'keep-alive',
-	        "Cookie": cookie
-    	      ],
-    	      ignoreSSLIssues: true
-    	  ]
+	if (location.hub.firmwareVersionString >= "2.3.2.120") {
+		HEid = getInstalledBundlesList().findAll{it.name == bundleName}.id[0]
+	}
+	else
+	{
+		def gIB = []
+		def params = [
+			uri: getBaseUrl(),
+			path: "/bundle/list",
+			contentType: "text/html",
+			textParser: true,
+			headers: [
+				"Connection": 'keep-alive',
+				"Cookie": cookie
+			],
+			ignoreSSLIssues: true
+		]
 
-    	  try {
-    	      httpGet(params) { resp ->
-			if(resp!= null) {
-				def matcherText = resp.data.text.replace("\n","").replace("\r","")
-				def matcher = matcherText.findAll(/(<tr class="bundle-row" data-bundle-id="[^<>]+">.*?<\/tr>)/).each {
-					def allFields = it.findAll(/(<td .*?<\/td>)/) // { match,f -> return f }
-					def id = it.find(/data-bundle-id="([^"]+)"/) { match,i -> return i.trim() }
-					def name = allFields[0].find(/title="([^"]+)/) { match,t -> return t.trim() }
-					gIB += [id:id,name:name]
-    	          		}
-    	         } else {
-    	              log.error "Null Response"
-    	              return false
-    	          }
-    	      }
-    	  } catch (exception) {
-    	      log.error "Read Ext Error: ${exception.message}"
-    	      return false;
-    	  }
+		try {
+			httpGet(params) { resp ->
+				if(resp!= null) {
+					def matcherText = resp.data.text.replace("\n","").replace("\r","")
+					def matcher = matcherText.findAll(/(<tr class="bundle-row" data-bundle-id="[^<>]+">.*?<\/tr>)/).each {
+						def allFields = it.findAll(/(<td .*?<\/td>)/) // { match,f -> return f }
+						def id = it.find(/data-bundle-id="([^"]+)"/) { match,i -> return i.trim() }
+						def name = allFields[0].find(/title="([^"]+)/) { match,t -> return t.trim() }
+						gIB += [id:id,name:name]
+					}
+				} else {
+					log.error "Null Response"
+					return false
+				}
+			}
+		} catch (exception) {
+			log.error "Read Ext Error: ${exception.message}"
+			return false;
+		}
 
-    	  HEid = gIB.findAll{it.name == bundleName}.id[0]
-    }
+		  HEid = gIB.findAll{it.name == bundleName}.id[0]
+	}
 
 // let's delete the Bundle's HEid found above
-    if (location.hub.firmwareVersionString >= "2.3.8.108") {
+	if (location.hub.firmwareVersionString >= "2.3.8.108") {
 		try {
 			def params = [
 				uri: "${getBaseUrl()}/bundle/deleteJson/$HEid?full=true",
-	 			headers: [
+				headers: [
 					"Connection": 'keep-alive',
 					"Cookie": state.cookie
 				],
@@ -4468,13 +4492,13 @@ def uninstallBundle(bundleName) {
 
 		return false
 
-    } else {
+	} else {
 		try {
 			params = [
 				uri: getBaseUrl(),
 				path: "/bundle/delete/$HEid",
 				headers: [
-		        		"Connection": 'keep-alive',
+						"Connection": 'keep-alive',
 					"Cookie": state.cookie
 				],
 				timeout: 300,
@@ -4489,7 +4513,7 @@ def uninstallBundle(bundleName) {
 			log.error "Error uninstalling file: ${e}"
 		}
 		return false
-    }
+	}
 }
 
 def setBackgroundStatusMessage(msg, level="info") {
@@ -5008,8 +5032,8 @@ def getAppList() {
 			headers: [
 				Cookie: state.cookie
 			],
-		    ignoreSSLIssues: true
-		    ]
+			ignoreSSLIssues: true
+			]
 
 		try {
 			httpGet(params) { resp ->
@@ -5053,16 +5077,17 @@ def getAppList() {
 }
 
 
-def getLibraryList() {//New block of code
+def getLibraryList() {
+	def result = []
 	def params = [
-		uri: "http://127.0.0.1:8080/library/list",
+		uri: getBaseUrl(),
+		path: "/library/list"
 		textParser: true,
 		headers: [
 			Cookie: state.cookie
 		]
-	  ]
+	]
 
-	def result = []
 	try {
 		httpGet(params) { resp ->
 			def matcherText = resp.data.text.replace("\n","").replace("\r","")
