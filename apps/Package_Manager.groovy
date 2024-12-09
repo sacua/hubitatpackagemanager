@@ -9,7 +9,7 @@
  *
  *
  *
- *    sacua   v1.10.0   Add librairy type of file for package manifest
+ *    sacua   v1.10.0   Add library type of file for package manifest
  *	
  *    csteele v1.9.3    improved displayHeader to include the Main Menu Option selected
  *                         refactored delete app to use new endpoint
@@ -5081,7 +5081,7 @@ def getLibraryList() {
 	def result = []
 	def params = [
 		uri: getBaseUrl(),
-		path: "/library/list"
+		path: "/library/list",
 		textParser: true,
 		headers: [
 			Cookie: state.cookie
